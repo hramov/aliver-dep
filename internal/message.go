@@ -3,6 +3,7 @@ package internal
 type Message struct {
 	FromPeerID string
 	Type       MessageType
+	CurrentId  string
 }
 
 func (m *Message) IsAliveMessage() bool {
@@ -22,4 +23,8 @@ const (
 	ALIVE
 	ELECTED
 	OK
+)
+
+const (
+	UNAVAILABLE = "1000"
 )

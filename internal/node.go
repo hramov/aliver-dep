@@ -13,7 +13,9 @@ import (
 )
 
 type Node struct {
-	ID       string
+	ID        string
+	CurrentId string
+
 	Addr     string
 	Peers    *Peers
 	eventBus event.Bus
@@ -72,10 +74,16 @@ func NewNode(nodeID string, servers []Server, checkScript string, checkInterval 
 			case c := <-node.checkCh:
 				if !c {
 					log.Info().Msgf("%s is down", node.ID)
+					if node.CurrentId < UNAVAILABLE {
+						node.CurrentId = UNAVAILABLE
+						node.Elect()
+					}
 				}
 			}
 		}
 	}()
+
+	node.CurrentId = node.ID
 
 	return node
 }
@@ -155,7 +163,7 @@ func (node *Node) Elect() {
 		}
 
 		log.Debug().Msgf("%s send ELECTION message to peer %s", node.ID, peer.ID)
-		electionMessage := Message{FromPeerID: node.ID, Type: ELECTION}
+		electionMessage := Message{FromPeerID: node.ID, Type: ELECTION, CurrentId: node.CurrentId}
 
 		reply, _ := node.CommunicateWithPeer(peer.RPCClient, electionMessage)
 
@@ -210,7 +218,7 @@ ping:
 }
 
 func (node *Node) IsRankHigherThan(id string) bool {
-	return strings.Compare(node.ID, id) == 1
+	return strings.Compare(node.ID, id) == -1
 }
 
 func (node *Node) IsItself(id string) bool {
