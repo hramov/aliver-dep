@@ -1,9 +1,13 @@
 package main
 
 import (
-	"errors"
+	"context"
+	"fmt"
+	"github.com/joho/godotenv"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"leader-election/internal"
+	"net"
 	"net/rpc"
 	"os"
 	"os/signal"
@@ -14,21 +18,47 @@ import (
 func main() {
 	setLogConfigurations()
 
-	nodeID, err := getNodeID()
+	if os.Getenv("ALIVER_ENV") == "" {
+		err := godotenv.Load()
+		if err != nil {
+			log.Fatal().Err(fmt.Errorf("error loading .env file"))
+		}
+	}
+
+	configPath := os.Getenv("ALIVER_CONFIG_PATH")
+	if configPath == "" {
+		log.Fatal().Err(fmt.Errorf("config path env is not set"))
+	}
+
+	cfg := internal.Config{}
+	err := internal.LoadConfig(configPath, &cfg)
+	if err != nil {
+		log.Fatal().Err(fmt.Errorf("cannot parse config file: %v\n", err))
+	}
+
+	nodeID := cfg.InstanceID
 	if err != nil {
 		log.Fatal().Err(err)
 	}
 
-	node := NewNode(nodeID)
+	node := internal.NewNode(nodeID, cfg.Servers, cfg.CheckScript, cfg.CheckInterval, cfg.CheckRetries, cfg.CheckTimeout, cfg.RunScript, cfg.RunTimeout, cfg.StopScript, cfg.StopTimeout)
 
 	listener, err := node.NewListener()
 	if err != nil {
 		log.Fatal().Err(err)
 	}
-	defer listener.Close()
+	defer func(listener net.Listener) {
+		err = listener.Close()
+		if err != nil {
+			log.Fatal().Err(err)
+		}
+	}(listener)
 
 	rpcServer := rpc.NewServer()
-	rpcServer.Register(node)
+	err = rpcServer.Register(node)
+	if err != nil {
+		log.Fatal().Err(err)
+	}
 
 	go rpcServer.Accept(listener)
 
@@ -43,15 +73,8 @@ func main() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	<-c
-}
 
-func getNodeID() (string, error) {
-	if len(os.Args) < 2 {
-		return "", errors.New("node id required")
-	}
-
-	nodeID := os.Args[1]
-	return nodeID, nil
+	node.StopService(context.Background())
 }
 
 func setLogConfigurations() {

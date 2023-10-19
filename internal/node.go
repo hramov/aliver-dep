@@ -1,38 +1,81 @@
-package main
+package internal
 
 import (
+	"context"
 	"github.com/rs/zerolog/log"
-	"leader-election/event"
+	"leader-election/pkg/event"
+	"leader-election/pkg/executor"
 	"net"
 	"net/rpc"
+	"strconv"
 	"strings"
 	"time"
 )
-
-// nodeAddressByID: It includes nodes currently in cluster
-var nodeAddressByID = map[string]string{
-	"node-01": "node-01:6001",
-	"node-02": "node-02:6002",
-	"node-03": "node-03:6003",
-	"node-04": "node-04:6004",
-}
 
 type Node struct {
 	ID       string
 	Addr     string
 	Peers    *Peers
 	eventBus event.Bus
+
+	servers map[string]Server
+
+	leaderId string
+
+	checkScript   string
+	checkInterval time.Duration
+	checkRetries  int
+	checkTimeout  time.Duration
+
+	runScript  string
+	runTimeout time.Duration
+
+	stopScript  string
+	stopTimeout time.Duration
+
+	checkCh chan bool
 }
 
-func NewNode(nodeID string) *Node {
+func NewNode(nodeID string, servers []Server, checkScript string, checkInterval time.Duration, checkRetries int, checkTimeout time.Duration, runScript string, runTimeout time.Duration, stopScript string, stopTimeout time.Duration) *Node {
 	node := &Node{
 		ID:       nodeID,
-		Addr:     nodeAddressByID[nodeID],
 		Peers:    NewPeers(),
 		eventBus: event.NewBus(),
+
+		servers: make(map[string]Server),
+
+		checkScript:   checkScript,
+		checkInterval: checkInterval,
+		checkRetries:  checkRetries,
+		checkTimeout:  checkTimeout,
+		runScript:     runScript,
+		runTimeout:    runTimeout,
+		stopScript:    stopScript,
+		stopTimeout:   stopTimeout,
+
+		checkCh: make(chan bool),
 	}
 
+	for _, v := range servers {
+		node.servers[v.Id] = v
+	}
+
+	node.Addr = node.servers[node.ID].Ip + ":" + strconv.Itoa(node.servers[node.ID].Port)
+
+	log.Info().Msgf("my addr is %s", node.Addr)
+
 	node.eventBus.Subscribe(event.LeaderElected, node.PingLeaderContinuously)
+
+	go func() {
+		for {
+			select {
+			case c := <-node.checkCh:
+				if !c {
+					log.Info().Msgf("%s is down", node.ID)
+				}
+			}
+		}
+	}()
 
 	return node
 }
@@ -43,12 +86,12 @@ func (node *Node) NewListener() (net.Listener, error) {
 }
 
 func (node *Node) ConnectToPeers() {
-	for peerID, peerAddr := range nodeAddressByID {
+	for peerID, peerAddr := range node.servers {
 		if node.IsItself(peerID) {
 			continue
 		}
 
-		rpcClient := node.connect(peerAddr)
+		rpcClient := node.connect(peerAddr.Ip + ":" + strconv.Itoa(peerAddr.Port))
 		pingMessage := Message{FromPeerID: node.ID, Type: PING}
 		reply, _ := node.CommunicateWithPeer(rpcClient, pingMessage)
 
@@ -60,6 +103,7 @@ func (node *Node) ConnectToPeers() {
 }
 
 func (node *Node) connect(peerAddr string) *rpc.Client {
+	log.Info().Msgf("Connecting to %s", peerAddr)
 retry:
 	client, err := rpc.Dial("tcp", peerAddr)
 	if err != nil {
@@ -124,7 +168,10 @@ func (node *Node) Elect() {
 		leaderID := node.ID
 		electedMessage := Message{FromPeerID: leaderID, Type: ELECTED}
 		node.BroadcastMessage(electedMessage)
+		node.leaderId = leaderID
 		log.Info().Msgf("%s is a new leader", node.ID)
+		node.StartService(context.Background())
+		go node.CheckService(context.Background())
 	}
 }
 
@@ -168,4 +215,55 @@ func (node *Node) IsRankHigherThan(id string) bool {
 
 func (node *Node) IsItself(id string) bool {
 	return node.ID == id
+}
+
+func (node *Node) CheckService(ctx context.Context) {
+	var err error
+	var cancel context.CancelFunc
+	var timeoutCtx context.Context
+
+	for {
+		select {
+		case <-ctx.Done():
+			cancel()
+			return
+		default:
+			if node.leaderId == node.ID {
+				timeoutCtx, cancel = context.WithTimeout(ctx, node.checkTimeout)
+				err = executor.Execute(timeoutCtx, node.checkScript)
+				if err != nil {
+					node.checkCh <- false
+				} else {
+					node.checkCh <- true
+				}
+			}
+		}
+		time.Sleep(node.checkInterval)
+	}
+}
+
+func (node *Node) StartService(ctx context.Context) {
+	timeoutCtx, cancel := context.WithTimeout(ctx, node.runTimeout)
+	defer cancel()
+
+	log.Info().Msgf("%s is starting service", node.ID)
+	err := executor.Execute(timeoutCtx, node.runScript)
+	if err != nil {
+		node.checkCh <- false
+	} else {
+		node.checkCh <- true
+	}
+}
+
+func (node *Node) StopService(ctx context.Context) {
+	timeoutCtx, cancel := context.WithTimeout(ctx, node.stopTimeout)
+	defer cancel()
+
+	log.Info().Msgf("%s is stopping service", node.ID)
+	err := executor.Execute(timeoutCtx, node.stopScript)
+	if err != nil {
+		node.checkCh <- false
+	} else {
+		node.checkCh <- true
+	}
 }
